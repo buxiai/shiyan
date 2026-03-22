@@ -1,0 +1,6 @@
+{
+    "aeroplane": ["wing", "tail", "engine", "fuselage", "cockpit"],
+    "bicycle": ["wheel", "handlebar", "pedal", "saddle", "chain"],
+    "bird": ["beak", "wing", "feather", "claw", "tail"],
+    "boat": ["hull", "deck", "mast", "sail", "cabin"]
+}
