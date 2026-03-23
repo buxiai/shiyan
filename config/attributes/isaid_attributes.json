@@ -1,6 +1,0 @@
-{
-    "storage_tank": ["circular roof", "cylindrical body", "shadow", "white top"],
-    "large_vehicle": ["rectangular roof", "container", "cab", "wheels"],
-    "small_vehicle": ["windshield", "car roof", "rear window", "shadow"],
-    "tennis_court": ["rectangular boundary", "net", "baseline", "green or blue surface"]
-}
