@@ -1,4 +1,5 @@
 import os
+os.environ['OMP_NUM_THREADS'] = '1'
 import random
 import time
 import cv2
@@ -6,6 +7,7 @@ import numpy as np
 import logging
 import argparse
 
+from torch.cuda.amp import autocast, GradScaler
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
@@ -58,7 +60,7 @@ def get_logger():
     logger.addHandler(handler)
     return logger
 
-
+# [✓ 修复1] 确保子进程有不同的随机种子
 def worker_init_fn(worker_id):
     random.seed(args.manual_seed + worker_id)
 
@@ -73,8 +75,7 @@ def main():
     assert args.classes > 1
     assert args.zoom_factor in [1, 2, 4, 8]
     assert (args.train_h - 1) % 8 == 0 and (args.train_w - 1) % 8 == 0
-    # os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(str(x) for x in args.train_gpu)
-    # print(os.environ["CUDA_VISIBLE_DEVICES"])
+
     if args.manual_seed is not None:
         cudnn.benchmark = False
         cudnn.deterministic = True
@@ -101,7 +102,6 @@ def main():
 
 
 
-# from thop import profile
 def main_worker(gpu, ngpus_per_node, argss):
     global args
     args = argss
@@ -159,7 +159,6 @@ def main_worker(gpu, ngpus_per_node, argss):
                 {'params': model.res2.parameters()},
                 {'params': model.cls.parameters()},  #
                 {'params': model.theta_mid.parameters()},
-                # {'params': model.mid_nsm.parameters()},
             ],
             lr=args.base_lr, momentum=args.momentum, weight_decay=args.weight_decay)
     else:
@@ -187,7 +186,9 @@ def main_worker(gpu, ngpus_per_node, argss):
     logger.info(model)
     print(args)
 
-    model = torch.nn.DataParallel(model.cuda())
+    model = model.cuda()
+    if len(args.train_gpu) > 1:
+        model = torch.nn.DataParallel(model)
 
     if args.weight:
         if os.path.isfile(args.weight):
@@ -250,52 +251,88 @@ def main_worker(gpu, ngpus_per_node, argss):
                                  use_coco=args.use_coco, use_split_coco=args.use_split_coco)
 
     train_sampler = None
+    
+    # [✓ 修复2] 这里补上了 worker_init_fn=worker_init_fn ！！！
     train_loader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, shuffle=(train_sampler is None),
                                                num_workers=args.workers, pin_memory=True, sampler=train_sampler,
-                                               drop_last=True)
+                                               drop_last=True, worker_init_fn=worker_init_fn)
 
+    scaler = GradScaler()  
     max_iou = 0.
     filename = 'PFENet2Plus.pth'
+    
+    # ================= 新增：早停机制 (Early Stopping) 设置 =================
+    patience = 10          # 容忍度：最多允许多少个 Epoch 验证集指标没有提升
+    patience_counter = 0   # 计数器：记录当前连续多少个 Epoch 没有提升
+    best_epoch = 0         # 记录取得最高指标的 Epoch
+    # ========================================================================
+    
+    # [✓ 修复3] 删除了在这里每个 epoch 都重置随机种子的代码
     for epoch in range(args.start_epoch, args.epochs):
-        if args.fix_random_seed_val:
-            torch.cuda.manual_seed(args.manual_seed + epoch)
-            np.random.seed(args.manual_seed + epoch)
-            torch.manual_seed(args.manual_seed + epoch)
-            torch.cuda.manual_seed_all(args.manual_seed + epoch)
-            random.seed(args.manual_seed + epoch)
-
         epoch_log = epoch + 1
-        loss_train, mIoU_train, mAcc_train, allAcc_train = train(train_loader, model, optimizer, epoch)
+        loss_train, mIoU_train, mAcc_train, allAcc_train = train(train_loader, model, optimizer, epoch, scaler)
+        
         if main_process():
             writer.add_scalar('loss_train', loss_train, epoch_log)
             writer.add_scalar('mIoU_train', mIoU_train, epoch_log)
             writer.add_scalar('mAcc_train', mAcc_train, epoch_log)
             writer.add_scalar('allAcc_train', allAcc_train, epoch_log)
 
-        if args.evaluate and  epoch % 2 == 0:
+        # 你的代码里是每 2 个 epoch 验证一次
+        if args.evaluate and epoch % 2 == 0:
             loss_val, mIoU_val, mAcc_val, allAcc_val, class_miou = validate(val_loader, model, criterion)
 
             if main_process():
+                # ================= 补上下面这一行 =================
                 writer.add_scalar('loss_val', loss_val, epoch_log)
-                writer.add_scalar('mIoU_val', mIoU_val, epoch_log)
-                writer.add_scalar('mAcc_val', mAcc_val, epoch_log)
+                # ==================================================
+                
+                writer.add_scalar('mIoU_val', mIoU_val.mean(), epoch_log)
+                writer.add_scalar('mAcc_val', mAcc_val.mean(), epoch_log)
+                writer.add_scalar('allAcc_val', float(np.mean(allAcc_val)), epoch_log)
                 writer.add_scalar('class_miou_val', class_miou, epoch_log)
-                writer.add_scalar('allAcc_val', allAcc_val, epoch_log)
+                
+            # ================= 早停与保存模型核心逻辑 =================
             if class_miou > max_iou:
                 max_iou = class_miou
+                best_epoch = epoch
+                patience_counter = 0  # ✅ 发现新高，重置没进步的计数器
+                
                 if os.path.exists(filename):
                     os.remove(filename)
                 filename = args.save_path + str(epoch) + '_' + str(max_iou) + '.pth'
-                logger.info('Saving checkpoint to: ' + filename)
+                
+                if main_process():
+                    logger.info('⭐ 验证集指标提升! Saving checkpoint to: ' + filename)
+                
                 torch.save({'epoch': epoch, 'state_dict': model.state_dict(), 'optimizer': optimizer.state_dict()},
                            filename)
+            else:
+                # ❌ 没有提升，计数器累加。因为你是每 2 个 epoch 验证一次，所以这里加 2
+                patience_counter += 2 
+            
+            if main_process():
+                logger.info(f'⏳ 早停监控 (Early Stopping): {patience_counter} / {patience} epochs without improvement.')
 
+            # 判断是否触发早停
+            if patience_counter >= patience:
+                if main_process():
+                    logger.info('='*50)
+                    logger.info(f'🛑 触发早停机制 (Early Stopping)!')
+                    logger.info(f'模型在过去 {patience} 个 Epoch 内没有实质性进步。')
+                    logger.info(f'最佳 Epoch 为: {best_epoch}, 取得的最高 mIoU: {max_iou:.4f}')
+                    logger.info('='*50)
+                break  # 直接跳出 for epoch 循环，结束训练
+            # ========================================================
+
+    # 循环结束后，保存最终的模型状态
     filename = args.save_path + 'final.pth'
-    logger.info('Saving checkpoint to: ' + filename)
+    if main_process():
+        logger.info('Saving final checkpoint to: ' + filename)
     torch.save({'epoch': args.epochs, 'state_dict': model.state_dict(), 'optimizer': optimizer.state_dict()}, filename)
 
 
-def train(train_loader, model, optimizer, epoch):
+def train(train_loader, model, optimizer, epoch, scaler):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     main_loss_meter = AverageMeter()
@@ -309,11 +346,12 @@ def train(train_loader, model, optimizer, epoch):
     model.train()
     if args.fix_bn:
         print('=== BN is fixed ===')
-        model.module.layer0.eval()
-        model.module.layer1.eval()
-        model.module.layer2.eval()
-        model.module.layer3.eval()
-        model.module.layer4.eval()
+        m = model.module if hasattr(model, 'module') else model
+        m.layer0.eval()
+        m.layer1.eval()
+        m.layer2.eval()
+        m.layer3.eval()
+        m.layer4.eval()
 
     end = time.time()
     max_iter = args.epochs * len(train_loader)
@@ -332,15 +370,19 @@ def train(train_loader, model, optimizer, epoch):
         input = input.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)
 
-        output, main_loss, aux_loss = model(s_x=s_input, s_y=s_mask, x=input, y=target)
+        optimizer.zero_grad() 
+        
+        with autocast():
+            output, main_loss, aux_loss = model(s_x=s_input, s_y=s_mask, x=input, y=target)
 
-        if not args.multiprocessing_distributed:
-            main_loss, aux_loss = torch.mean(main_loss), torch.mean(aux_loss)
-        loss = main_loss + args.aux_weight * aux_loss
-        optimizer.zero_grad()
-
-        loss.backward()
-        optimizer.step()
+            if not args.multiprocessing_distributed:
+                main_loss, aux_loss = torch.mean(main_loss), torch.mean(aux_loss)
+            loss = main_loss + args.aux_weight * aux_loss
+            
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        
         n = input.size(0)
         if args.multiprocessing_distributed:
             main_loss, aux_loss, loss = main_loss.detach() * n, aux_loss * n, loss * n
@@ -434,73 +476,84 @@ def validate(val_loader, model, criterion):
 
     model.eval()
     end = time.time()
-    if args.split != 999:  # 0
+    if args.split != 999:  
         if args.use_coco:
             test_num = 5000
         else:
             test_num = 1000
     else:
-        test_num = len(val_loader)  # 1449
+        test_num = len(val_loader)  
     assert test_num % args.batch_size_val == 0
     iter_num = 0
     total_time = 0
-    for e in range(10):
-        for i, (input, target, s_input, s_mask, subcls, ori_label) in enumerate(val_loader):
-            if (iter_num - 1) * args.batch_size_val >= test_num:
+    is_finished = False  
+    
+    # [✓ 修复4] 这里加了 with torch.no_grad(): 防止验证集爆炸
+    with torch.no_grad():
+        for e in range(10):
+            if is_finished:  
                 break
-            iter_num += 1
-            data_time.update(time.time() - end)
-            input = input.cuda(non_blocking=True)
-            target = target.cuda(non_blocking=True)
-            ori_label = ori_label.cuda(non_blocking=True)
-            start_time = time.time()
-            output = model(s_x=s_input, s_y=s_mask, x=input, y=target)
-            total_time = total_time + 1
-            model_time.update(time.time() - start_time)
+                
+            for i, (input, target, s_input, s_mask, subcls, ori_label) in enumerate(val_loader):
+                if (iter_num - 1) * args.batch_size_val >= test_num:
+                    is_finished = True  
+                    break
+                iter_num += 1
+                data_time.update(time.time() - end)
+                input = input.cuda(non_blocking=True)
+                target = target.cuda(non_blocking=True)
+                ori_label = ori_label.cuda(non_blocking=True)
+                
+                s_input = s_input.cuda(non_blocking=True)
+                s_mask = s_mask.cuda(non_blocking=True)
+                
+                start_time = time.time()
+                output = model(s_x=s_input, s_y=s_mask, x=input, y=target)
+                total_time = total_time + 1
+                model_time.update(time.time() - start_time)
 
-            if args.ori_resize:
-                longerside = max(ori_label.size(1), ori_label.size(2))
-                backmask = torch.ones(ori_label.size(0), longerside, longerside).cuda() * 255
-                backmask[0, :ori_label.size(1), :ori_label.size(2)] = ori_label
-                target = backmask.clone().long()
+                if args.ori_resize:
+                    longerside = max(ori_label.size(1), ori_label.size(2))
+                    backmask = torch.ones(ori_label.size(0), longerside, longerside).cuda() * 255
+                    backmask[0, :ori_label.size(1), :ori_label.size(2)] = ori_label
+                    target = backmask.clone().long()
 
-            output = F.interpolate(output, size=target.size()[1:], mode='bilinear', align_corners=True)
-            loss = criterion(output, target)
+                output = F.interpolate(output, size=target.size()[1:], mode='bilinear', align_corners=True)
+                loss = criterion(output, target)
 
-            n = input.size(0)
-            loss = torch.mean(loss)
+                n = input.size(0)
+                loss = torch.mean(loss)
 
-            output = output.max(1)[1]
+                output = output.max(1)[1]
 
-            intersection, union, new_target = intersectionAndUnionGPU(output, target, args.classes, args.ignore_label)
-            intersection, union, target, new_target = intersection.cpu().numpy(), union.cpu().numpy(), target.cpu().numpy(), new_target.cpu().numpy()
-            intersection_meter.update(intersection), union_meter.update(union), target_meter.update(new_target)
+                intersection, union, new_target = intersectionAndUnionGPU(output, target, args.classes, args.ignore_label)
+                intersection, union, target, new_target = intersection.cpu().numpy(), union.cpu().numpy(), target.cpu().numpy(), new_target.cpu().numpy()
+                intersection_meter.update(intersection), union_meter.update(union), target_meter.update(new_target)
 
-            subcls = subcls[0].cpu().numpy()[0]
-            class_intersection_meter[(subcls - 1) % split_gap] += intersection[1]
-            class_union_meter[(subcls - 1) % split_gap] += union[1]
+                subcls = subcls[0].cpu().numpy()[0]
+                class_intersection_meter[(subcls - 1) % split_gap] += intersection[1]
+                class_union_meter[(subcls - 1) % split_gap] += union[1]
 
-            accuracy = sum(intersection_meter.val) / (sum(target_meter.val) + 1e-10)
-            loss_meter.update(loss.item(), input.size(0))
-            batch_time.update(time.time() - end)
-            end = time.time()
-            if ((i + 1) % (test_num / 100) == 0) and main_process():
-                logger.info('Test: [{}/{}] '
-                            'Data {data_time.val:.3f} ({data_time.avg:.3f}) '
-                            'Batch {batch_time.val:.3f} ({batch_time.avg:.3f}) '
-                            'Loss {loss_meter.val:.4f} ({loss_meter.avg:.4f}) '
-                            'Accuracy {accuracy:.4f}.'.format(iter_num * args.batch_size_val, test_num,
-                                                              data_time=data_time,
-                                                              batch_time=batch_time,
-                                                              loss_meter=loss_meter,
-                                                              accuracy=accuracy))
+                accuracy = sum(intersection_meter.val) / (sum(target_meter.val) + 1e-10)
+                loss_meter.update(loss.item(), input.size(0))
+                batch_time.update(time.time() - end)
+                end = time.time()
+                if ((i + 1) % (test_num / 100) == 0) and main_process():
+                    logger.info('Test: [{}/{}] '
+                                'Data {data_time.val:.3f} ({data_time.avg:.3f}) '
+                                'Batch {batch_time.val:.3f} ({batch_time.avg:.3f}) '
+                                'Loss {loss_meter.val:.4f} ({loss_meter.avg:.4f}) '
+                                'Accuracy {accuracy:.4f}.'.format(iter_num * args.batch_size_val, test_num,
+                                                                  data_time=data_time,
+                                                                  batch_time=batch_time,
+                                                                  loss_meter=loss_meter,
+                                                                  accuracy=accuracy))
 
     iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
     accuracy_class = intersection_meter.sum / (target_meter.sum + 1e-10)
     mIoU = np.mean(iou_class)
     mAcc = np.mean(accuracy_class)
 
-    #allAcc = sum(intersection_meter.sum) / (sum(target_meter.sum) + 1e-10)
     allAcc = intersection_meter.sum / (target_meter.sum + 1e-10)
     class_iou_class = []
     class_miou = 0
@@ -514,14 +567,13 @@ def validate(val_loader, model, criterion):
         logger.info('Class_{} Result: iou {:.4f}.'.format(i + 1, class_iou_class[i]))
 
     if main_process():
-        logger.info('FBIoU---Val result: mIoU/mAcc/allAcc {:.4f}/{:.4f}/{:.4f}.'.format(mIoU, mAcc, allAcc))
-      #  for i in range(args.classes):
-      #      logger.info('Class_{} Result: iou/accuracy {:.4f}/{:.4f}.'.format(i, iou_class[i], accuracy_class[i]))
+         logger.info('FBIoU--Val result: mIoU/mAcc/allAcc {:.4f}/{:.4f}/{:.4f}.'.format(
+            np.mean(mIoU), np.mean(mAcc), np.mean(allAcc)
+          ))
     try:
             for i in range(args.classes):
                 logger.info('Class_{} Result: iou/accuracy {:.4f}/{:.4f}.'.format(i, iou_class[i], accuracy_class[i]))
     except TypeError:
-            # 如果是单数(float)，不支持 [i] 索引，就直接打印总体结果
             logger.info('Overall Result: iou/accuracy {:.4f}/{:.4f}.'.format(float(iou_class), float(accuracy_class)))
     logger.info('<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<')
 
