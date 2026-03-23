@@ -479,3 +479,4 @@ class PFENet2Plus(nn.Module):
             return out.max(1)[1], main_loss, aux_loss
         else:
             return out
+
